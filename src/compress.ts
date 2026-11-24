@@ -1,5 +1,8 @@
-export type Settings = { limit: number; edge?: number };
-export type Output = { blob: Blob; width: number; height: number };
+import { restoreDetail, softenJpegArtifacts } from './detail';
+import { tiledPng } from './tiled-png';
+
+export type Settings = { limit: number; edge?: number; upscale?: 2 | 4; cleanup?: boolean; ai?: 'photo' | 'light' };
+export type Output = { blob: Blob; width: number; height: number; cleaned?: Blob };
 
 function inspect(bytes: ArrayBuffer) {
   const v = new DataView(bytes);
@@ -70,14 +73,91 @@ async function decode(blob: Blob) {
   } finally { URL.revokeObjectURL(url); }
 }
 
-export async function compress(file: File, settings: Settings): Promise<Output> {
+async function fit(encode: ReturnType<typeof surface>['encode'], type: string, limit: number) {
+  let low = 0.08, high = 0.98;
+  let candidate: Blob | undefined;
+  for (let i = 0; i < (type === 'image/png' ? 1 : 7); i++) {
+    const quality = i === 0 ? high : i === 1 ? low : (low + high) / 2;
+    const blob = await encode(type, quality);
+    if (blob.type !== type) break;
+    if (blob.size <= limit) {
+      candidate = blob;
+      low = quality;
+      if (i === 0) break;
+    } else {
+      high = quality;
+      if (i === 1) break;
+    }
+  }
+  return candidate;
+}
+
+export async function compress(file: File, settings: Settings, onProgress?: (done: number, total: number) => void): Promise<Output> {
   const meta = inspect(await file.arrayBuffer());
   if (!meta.width || !meta.height) throw new Error('This image has invalid dimensions.');
   const original = await decode(file.slice(0, file.size, meta.type));
   const { width, height } = original;
   try {
+    if (settings.upscale) {
+      const w = width * settings.upscale, h = height * settings.upscale;
+      if (settings.ai && (settings.upscale !== 2 || width * height > 2_000_000 || Math.max(w, h) > 8192)) {
+        throw new Error('AI 2× accepts images up to 2 megapixels and 4,096 pixels per side. Choose Standard for larger images.');
+      }
+      if (w * h > 24_000_000 || Math.max(w, h) > 8192) {
+        const blob = await tiledPng(original, w, h, (width, height) => surface(width, height, { willReadFrequently: true }));
+        return { blob, width: w, height: h };
+      }
+      const { canvas, context, encode } = surface(w, h, { willReadFrequently: true });
+      try {
+        if (settings.ai === 'photo') {
+          const { enhancePhoto } = await import('./photo-ai');
+          const scratch = surface(128, 128, { willReadFrequently: true });
+          try {
+            await enhancePhoto(original, width, height, context, scratch.context, onProgress);
+          } finally { scratch.canvas.width = scratch.canvas.height = 1; }
+        } else if (settings.ai === 'light') {
+          const { upscaleWithAI } = await import('./super-resolution');
+          const scratch = surface(76, 76, { willReadFrequently: true });
+          await upscaleWithAI(original, width, height, context, scratch.context);
+        } else {
+          context.imageSmoothingQuality = 'high';
+          context.drawImage(original, 0, 0, w, h);
+          const pixels = context.getImageData(0, 0, w, h);
+          restoreDetail(pixels.data, w, h);
+          context.putImageData(pixels, 0, 0);
+        }
+        let blob = await encode('image/webp', 0.9);
+        // Some canvas implementations silently fall back to PNG.
+        if (blob.type === 'image/webp' && blob.size > file.size * 2) {
+          for (const quality of [0.84, 0.78]) {
+            const candidate = await encode('image/webp', quality);
+            if (candidate.type === 'image/webp' && candidate.size < blob.size) blob = candidate;
+            if (blob.size <= file.size * 2) break;
+          }
+        }
+        return { blob, width: w, height: h };
+      } finally { canvas.width = canvas.height = 1; }
+    }
+    async function withCleanup(output: Output): Promise<Output> {
+      const { width: w, height: h } = output;
+      if (!settings.cleanup || meta.type !== 'image/jpeg' || w * h > 24_000_000 || Math.max(w, h) > 8192) return output;
+      try {
+        const { canvas, context, encode } = surface(w, h, { willReadFrequently: true });
+        try {
+          context.imageSmoothingQuality = 'high';
+          context.drawImage(original, 0, 0, w, h);
+          const image = context.getImageData(0, 0, w, h);
+          softenJpegArtifacts(image.data, w, h);
+          context.putImageData(image, 0, 0);
+          const cleaned = await fit(encode, output.blob.type, Math.min(settings.limit, file.size - 1));
+          return cleaned?.size ? { ...output, cleaned } : output;
+        } finally { canvas.width = canvas.height = 1; }
+      } catch {
+        return output;
+      }
+    }
     if (file.size <= settings.limit && Math.max(width, height) <= (settings.edge ?? Infinity)) {
-      return { blob: file.slice(0, file.size, meta.type), width, height };
+      return await withCleanup({ blob: file.slice(0, file.size, meta.type), width, height });
     }
     // Bound the encoding canvas, rather than rejecting high-resolution input.
     const longEdge = Math.max(width, height);
@@ -109,7 +189,6 @@ export async function compress(file: File, settings: Settings): Promise<Output> 
         if (score < bestScore) { bestScore = score; best = { blob, width: w, height: h }; }
       } finally { bitmap.close(); }
     }
-    let firstFit = -1;
     for (let step = 0; step < 9; step++) {
       const scale = Math.max(1, Math.floor(base * 0.78 ** step)) / Math.max(width, height);
       const w = Math.max(1, Math.round(width * scale));
@@ -119,28 +198,13 @@ export async function compress(file: File, settings: Settings): Promise<Output> 
       drawing.drawImage(original, 0, 0, w, h);
       const types = meta.type === 'image/webp' ? [meta.type] : [meta.type, 'image/webp'];
       for (const type of types) {
-        let low = 0.08, high = 0.98;
-        let candidate: Blob | undefined;
-        for (let i = 0; i < (type === 'image/png' ? 1 : 7); i++) {
-          const quality = i === 0 ? high : i === 1 ? low : (low + high) / 2;
-          const blob = await encode(type, quality);
-          if (blob.type !== type) break;
-          if (blob.size <= settings.limit) {
-            candidate = blob;
-            low = quality;
-            if (i === 0) break;
-          } else {
-            high = quality;
-            if (i === 1) break;
-          }
-        }
+        const candidate = await fit(encode, type, settings.limit);
         if (candidate) await consider(candidate, w, h);
       }
       canvas.width = canvas.height = 1;
-      if (best && firstFit < 0) firstFit = step;
-      if ((firstFit >= 0 && step > firstFit) || bestScore <= 0.15 || (w === 1 && h === 1)) break;
+      if (best || (w === 1 && h === 1)) break;
     }
     if (!best) throw new Error('This image could not fit the selected limit locally.');
-    return best;
+    return await withCleanup(best);
   } finally { original.close(); }
 }

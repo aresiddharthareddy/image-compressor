@@ -15,6 +15,7 @@ button:disabled{cursor:default;opacity:.55}
 .image-icon{display:grid;place-items:center;color:#5341d5;background:#eeebff;width:42px;height:42px;border-radius:12px;margin-bottom:5px}
 .settings label{display:block;font-weight:600;font-size:.875rem;margin-bottom:7px}
 .controls{display:flex;gap:8px;flex-wrap:wrap}
+.mode{margin:16px 0}
 .size{display:flex;border:1px solid #dddde5;border-radius:10px;max-width:100%}
 input[type=number],select{border:0;background:white;border-radius:10px;padding:9px 10px}
 .size input{width:95px;min-width:0}
@@ -41,6 +42,7 @@ dialog::backdrop{background:#1a193cb0}
 dialog header{display:flex;justify-content:space-between;align-items:center}
 dialog h2{margin:0}
 .zoom{display:block;margin:10px 0}
+.cleanup-download{margin-top:12px}
 .compare{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 figure{margin:0}
 figure div{height:min(60vh,480px);overflow:auto;background:#eeeef2}
